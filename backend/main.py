@@ -1,19 +1,35 @@
-import json
+import hmac
 import os
 import re
+import threading
+import uuid
+from datetime import datetime, timezone
 from io import BytesIO
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.parse import quote
-from urllib.request import Request, urlopen
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pypdf import PdfReader
+from starlette.concurrency import run_in_threadpool
 
 MAX_FILE_BYTES = 25 * 1024 * 1024
 MAX_PAGES = 500
 MAX_TEXT_CHARS = 180_000
+DEVICE_STATUS_LOCK = threading.Lock()
+DEVICE_STATUS: dict[str, Any] = {
+    "job_id": "",
+    "status": "waiting",
+    "paper_title": "",
+    "summary": "",
+    "dataset_count": 0,
+    "datasets": [],
+    "metric_count": 0,
+    "metrics": [],
+    "models": [],
+    "source": "",
+    "error": "",
+    "updated_at": None,
+}
 
 app = FastAPI(
     title="PaperLens API",
@@ -59,7 +75,18 @@ METRIC_NAMES = [
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "ai_enabled": bool(os.getenv("GEMINI_API_KEY"))}
+    return {"status": "ok", "analysis_mode": "local"}
+
+
+@app.get("/api/device/status")
+def device_status(x_device_token: str | None = Header(default=None)) -> dict[str, Any]:
+    expected_token = os.getenv("PAPERLENS_DEVICE_TOKEN", "").strip()
+    if not expected_token:
+        raise HTTPException(status_code=503, detail="ESP32 status is disabled; configure PAPERLENS_DEVICE_TOKEN.")
+    if not x_device_token or not hmac.compare_digest(x_device_token, expected_token):
+        raise HTTPException(status_code=401, detail="Invalid or missing device token.")
+    with DEVICE_STATUS_LOCK:
+        return dict(DEVICE_STATUS)
 
 
 @app.post("/api/analyze")
@@ -72,6 +99,72 @@ async def analyze_pdf(file: UploadFile = File(...)) -> dict[str, Any]:
     if not content.startswith(b"%PDF-"):
         raise HTTPException(status_code=400, detail="The uploaded file does not appear to be a valid PDF.")
 
+    job_id = uuid.uuid4().hex
+    title = file.filename
+    _start_device_job(job_id, title)
+    _update_device_job(job_id, status="analyzing")
+    try:
+        extracted = await run_in_threadpool(analyze_content, content, title)
+    except HTTPException as exc:
+        _update_device_job(job_id, status="failed", error=str(exc.detail))
+        raise
+    except Exception:
+        _update_device_job(job_id, status="failed", error="Analysis failed unexpectedly.")
+        raise
+
+    datasets = extracted.get("datasets", [])
+    metrics = extracted.get("metrics", [])
+    methodology = extracted.get("methodology", {})
+    models = methodology.get("models", []) if isinstance(methodology, dict) else []
+    if not isinstance(models, list):
+        models = []
+    summary = extracted.get("summary", "")
+    _update_device_job(
+        job_id,
+        status="completed",
+        paper_title=extracted["paper_title"],
+        summary=summary[:400] if isinstance(summary, str) else "",
+        dataset_count=len(datasets),
+        datasets=[item["name"] for item in datasets[:8]],
+        metric_count=len(metrics),
+        metrics=[
+            {"name": item["name"], "value": item["value"]}
+            for item in metrics[:8]
+        ],
+        models=models[:8],
+        source=extracted["source"],
+        error="",
+    )
+    return extracted
+
+
+def _start_device_job(job_id: str, title: str) -> None:
+    global DEVICE_STATUS
+    with DEVICE_STATUS_LOCK:
+        DEVICE_STATUS = {
+            "job_id": job_id,
+            "status": "received",
+            "paper_title": title,
+            "summary": "",
+            "dataset_count": 0,
+            "datasets": [],
+            "metric_count": 0,
+            "metrics": [],
+            "models": [],
+            "source": "",
+            "error": "",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+def _update_device_job(job_id: str, **updates: Any) -> None:
+    with DEVICE_STATUS_LOCK:
+        if DEVICE_STATUS["job_id"] == job_id:
+            DEVICE_STATUS.update(updates)
+            DEVICE_STATUS["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def analyze_content(content: bytes, filename: str) -> dict[str, Any]:
     try:
         reader = PdfReader(BytesIO(content), strict=False)
         if reader.is_encrypted:
@@ -103,15 +196,10 @@ async def analyze_pdf(file: UploadFile = File(...)) -> dict[str, Any]:
     metadata = reader.metadata or {}
     title = clean_metadata(getattr(metadata, "title", None))
     author = clean_metadata(getattr(metadata, "author", None))
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if api_key:
-        extracted = extract_with_gemini(text, api_key)
-        source = "gemini"
-    else:
-        extracted = extract_locally(text)
-        source = "rules"
+    extracted = extract_locally(text)
+    source = "local"
 
-    extracted["paper_title"] = extracted.get("paper_title") or title or title_from_text(text) or file.filename
+    extracted["paper_title"] = extracted.get("paper_title") or title or title_from_text(text) or filename
     extracted["author"] = extracted.get("author") or author or ""
     extracted["year"] = extracted.get("year") or find_year(text)
     extracted["page_count"] = page_count
@@ -302,86 +390,7 @@ def find_metrics(text: str) -> list[dict[str, str]]:
     return metrics
 
 
-def extract_with_gemini(text: str, api_key: str) -> dict[str, Any]:
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
-    prompt = f"""Analyze this scientific paper text and return only valid JSON with this schema:
-{{
-  "paper_title": "string",
-  "author": "string",
-  "year": "string",
-  "summary": "concise summary grounded in the paper",
-  "methodology": {{"approach": "string", "experimental_methods": "string", "models": ["string"]}},
-  "datasets": [{{"name": "string", "context": "short source context", "confidence": "high|medium|low"}}],
-  "metrics": [{{"name": "metric", "value": "reported value with unit", "context": "short context"}}],
-  "verification_notes": ["uncertainty or detail that should be manually checked"]
-}}
-Do not invent values. Include a metric only when both metric name and reported value appear in the text. Return empty strings/lists when not found. The text may be truncated.
-
-PAPER TEXT:
-{text[:MAX_TEXT_CHARS]}"""
-    body = json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1},
-    }).encode("utf-8")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{quote(model, safe='-')}:generateContent"
-    request = Request(
-        url,
-        data=body,
-        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-        method="POST",
-    )
-    try:
-        with urlopen(request, timeout=60) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:500]
-        raise HTTPException(status_code=502, detail=f"Gemini API returned HTTP {exc.code}: {detail}") from exc
-    except (URLError, TimeoutError) as exc:
-        raise HTTPException(status_code=502, detail=f"Could not reach the Gemini API: {exc}") from exc
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise HTTPException(status_code=502, detail="Gemini returned an unreadable response.") from exc
-    try:
-        response_text = payload["candidates"][0]["content"]["parts"][0]["text"]
-        result = json.loads(response_text)
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-        raise HTTPException(status_code=502, detail="Gemini did not return the expected structured analysis.") from exc
-    if not isinstance(result, dict):
-        raise HTTPException(status_code=502, detail="Gemini returned an invalid analysis structure.")
-    result["methodology"] = result.get("methodology") if isinstance(result.get("methodology"), dict) else {}
-    result["datasets"] = normalize_datasets(result.get("datasets"))
-    result["metrics"] = normalize_metrics(result.get("metrics"))
-    return result
-
-
 def normalize_string_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [item.strip() for item in value if isinstance(item, str) and item.strip()][:20]
-
-
-def normalize_datasets(value: Any) -> list[dict[str, str]]:
-    if not isinstance(value, list):
-        return []
-    output = []
-    for item in value[:30]:
-        if isinstance(item, dict) and isinstance(item.get("name"), str) and item["name"].strip():
-            output.append({
-                "name": item["name"].strip(),
-                "context": str(item.get("context", "")).strip()[:300],
-                "confidence": item.get("confidence") if item.get("confidence") in {"high", "medium", "low"} else "medium",
-            })
-    return output
-
-
-def normalize_metrics(value: Any) -> list[dict[str, str]]:
-    if not isinstance(value, list):
-        return []
-    output = []
-    for item in value[:60]:
-        if isinstance(item, dict) and isinstance(item.get("name"), str) and isinstance(item.get("value"), (str, int, float)):
-            output.append({
-                "name": item["name"].strip()[:80],
-                "value": str(item["value"]).strip()[:50],
-                "context": str(item.get("context", "")).strip()[:300],
-            })
-    return output
